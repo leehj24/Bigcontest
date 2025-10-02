@@ -1,18 +1,19 @@
 # =====================================================================
 # App/run_simulation.py  (FULL)
-# - Streamlit self-bootstrap
-# - .d3 체크포인트 우선 로딩 + 실패 사유 수집
-# - torch.load(weights_only=False) 호환 래퍼
-# - 스케일러 자동 생성(없으면) + RC_M1_SAA_RANK 합성
-# - Q-values 디버그 패널 + 동점 타이브레이크
-# - 모델 관측 차원 vs 입력 차원 스키마 검증
+# - PowerShell에서:  py -3.13 .\run_simulation.py
+# - Streamlit self-bootstrap: 한 줄로 실행해도 자동으로 streamlit run
+# - d3 체크포인트(.d3)를 반드시 우선 로드 (캡션으로 무엇을 로드했는지 명시)
+# - 훈련=무스케일 → 추론도 무스케일(스케일 OFF)로 통일  ✅ 핵심 패치
+# - Q-values 디버그 패널로 학습/입력 이상 여부 즉시 점검
 # =====================================================================
 
-import os, sys, subprocess, random
+import os, sys, subprocess, random, json
 from pathlib import Path
 
+# ---------------------------------------------------------------------
+# Self-bootstrap: Python 파일을 직접 실행하면 streamlit로 재실행
+# ---------------------------------------------------------------------
 if __name__ == "__main__" and os.environ.get("STREAMLIT_BOOTSTRAPPED") != "1":
-    # Streamlit로 자기 자신을 실행 (PowerShell에서도 한 줄로)
     file_path = str(Path(__file__).resolve())
     env = os.environ.copy()
     env["STREAMLIT_BOOTSTRAPPED"] = "1"
@@ -20,26 +21,24 @@ if __name__ == "__main__" and os.environ.get("STREAMLIT_BOOTSTRAPPED") != "1":
     subprocess.run(cmd, env=env, check=False)
     sys.exit(0)
 
-# =====================================================================
+# ---------------------------------------------------------------------
 # 본 앱 로직
-# =====================================================================
+# ---------------------------------------------------------------------
 import streamlit as st
 import pandas as pd
 import numpy as np
-import d3rlpy
 import torch
-import joblib
+import d3rlpy
 from d3rlpy.algos import DiscreteCQL
-from sklearn.preprocessing import StandardScaler
 
-# --- PyTorch 2.6 호환: d3rlpy 내부 torch.load가 weights_only=True로 로드 실패 방지 ---
+# --- PyTorch 2.6+ 호환: d3rlpy 내부 torch.load(weights_only=True) 이슈 회피 ---
 import torch as _torch
 _torch_load_orig = _torch.load
 def _torch_load_compat(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)  # 구버전 .d3 호환
+    kwargs.setdefault("weights_only", False)
     return _torch_load_orig(*args, **kwargs)
 _torch.load = _torch_load_compat
-# ------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 # 전역 상수
 LATENT_DIM = 16
@@ -53,8 +52,8 @@ FEATURES = [
 
 # 경로 유틸
 def get_paths():
-    app_dir = Path(__file__).resolve().parent
-    root_dir = app_dir.parent  # Bigcontest
+    app_dir = Path(__file__).resolve().parent           # .../Bigcontest/App
+    root_dir = app_dir.parent                           # .../Bigcontest
     model_dir = root_dir / "Model"
     eda_dir = root_dir / "EDA"
     logs_dir = model_dir / "d3rlpy_logs" / "DiscreteCQL"
@@ -65,106 +64,9 @@ def get_paths():
         "EDA_DIR": eda_dir,
         "LOGS_DIR": logs_dir,
         "PARAMS_JSON": logs_dir / "params.json",
-        "SCALER_PKL": model_dir / "standard_scaler.pkl",
         "NODE_EMB": model_dir / "node_embeddings.csv",
-        "MERGED_CSV": eda_dir / "merged_data.csv",
-        "RL_DATASET": model_dir / "rl_dataset.csv",
+        "PT_FALLBACK": model_dir / "cql_model.pt",      # 최후의 보루(되도록 비활성 권장)
     }
-
-# 스케일러 확보(없으면 자동 생성) + RC_M1_SAA_RANK 합성
-def ensure_scaler(paths: dict) -> StandardScaler:
-    scaler_path = paths["SCALER_PKL"]
-    if scaler_path.exists():
-        return joblib.load(scaler_path)
-
-    # 데이터 소스 확보
-    if paths["MERGED_CSV"].exists():
-        df = pd.read_csv(paths["MERGED_CSV"], encoding="utf-8-sig")
-    elif paths["RL_DATASET"].exists():
-        df = pd.read_csv(paths["RL_DATASET"])
-    else:
-        raise FileNotFoundError(
-            "standard_scaler.pkl 없음 + EDA/merged_data.csv, Model/rl_dataset.csv 모두 없어 자동 생성 불가"
-        )
-
-    # RC_M1_SAA_RANK 없으면 즉석 합성
-    if "RC_M1_SAA_RANK" not in df.columns:
-        required = {"RC_M1_SAA", "TA_YM", "HPSN_MCT_ZCD_NM"}
-        if not required.issubset(df.columns):
-            raise ValueError(
-                "스케일러 생성 실패: RC_M1_SAA_RANK가 없고, 합성에 필요한 열(RC_M1_SAA, TA_YM, HPSN_MCT_ZCD_NM) 부족"
-            )
-        tmp = df.sort_values(
-            ["TA_YM", "HPSN_MCT_ZCD_NM", "RC_M1_SAA"],
-            ascending=[True, True, False]
-        ).copy()
-        tmp["__rank"] = tmp.groupby(["TA_YM", "HPSN_MCT_ZCD_NM"]).cumcount() + 1
-
-        def to_bins(s):
-            try:
-                return pd.qcut(s, q=6, labels=[1,2,3,4,5,6], duplicates="drop").astype(int)
-            except Exception:
-                # 표본 수 적을 때 예비 등분
-                n = len(s)
-                if n == 0:
-                    return s.astype(int)
-                edges = [(i*n)//6 for i in range(7)]
-                idx = s.values - 1
-                out = [min(max(sum(v >= e for e in edges[1:]) + 1, 1), 6) for v in idx]
-                return pd.Series(out, index=s.index).astype(int)
-
-        df["RC_M1_SAA_RANK"] = tmp.groupby(
-            ["TA_YM", "HPSN_MCT_ZCD_NM"]
-        )["__rank"].transform(to_bins)
-
-    # 스케일러 피팅
-    missing = [c for c in FEATURES if c not in df.columns]
-    if missing:
-        raise ValueError(f"스케일러 생성 실패: 학습 피처 누락 {missing}")
-
-    X = df[FEATURES].dropna()
-    if len(X) == 0:
-        raise ValueError("스케일러 생성 실패: 학습 데이터가 비어 있음")
-
-    scaler = StandardScaler().fit(X)
-    scaler_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(scaler, scaler_path)
-    return scaler
-
-# d3rlpy DiscreteCQL 모델 로드: .d3 최신 → 나머지 → (마지막) .pt
-def load_discrete_cql_with_fallback(params_path: Path, model_dir: Path, device: str):
-    """
-    우선순위: 가장 큰 스텝의 model_*.d3 -> 나머지 d3 -> (마지막) cql_model.pt
-    실패 사유를 문자열로 누적해 디버깅에 활용.
-    """
-    algo = DiscreteCQL.from_json(params_path, device=device)
-
-    logs_dir = model_dir / "d3rlpy_logs" / "DiscreteCQL"
-    d3_candidates = sorted(
-        logs_dir.glob("model_*.d3"),
-        key=lambda p: int(p.stem.split("_")[-1]),
-        reverse=True
-    )
-    pt_candidate = model_dir / "cql_model.pt"
-
-    tried_msgs = []
-
-    for p in d3_candidates:
-        try:
-            algo.load_model(str(p))
-            return algo, f"loaded: {p.name}"
-        except Exception as ex:
-            tried_msgs.append(f"d3 fail {p.name}: {type(ex).__name__}: {ex}")
-
-    if pt_candidate.exists() and pt_candidate.stat().st_size > 0:
-        try:
-            algo.load_model(str(pt_candidate))
-            return algo, f"loaded (pt): {pt_candidate.name}"
-        except Exception as ex:
-            tried_msgs.append(f"pt fail {pt_candidate.name}: {type(ex).__name__}: {ex}")
-
-    detail = "\n".join(tried_msgs) if tried_msgs else "(no candidates found)"
-    raise RuntimeError("모델 로딩 실패.\n" + detail)
 
 # 필수 파일 확인
 def assert_minimum_files(paths: dict):
@@ -175,33 +77,67 @@ def assert_minimum_files(paths: dict):
         problems.append(str(paths["PARAMS_JSON"]))
 
     logs_dir = paths["LOGS_DIR"]
-    has_any_ckpt = False
+    has_any_d3 = False
     if logs_dir.exists():
-        for p in logs_dir.glob("model_*.d3"):
+        for p in sorted(logs_dir.glob("model_*.d3")):
             if p.stat().st_size > 0:
-                has_any_ckpt = True
+                has_any_d3 = True
                 break
-    pt_path = paths["MODEL_DIR"] / "cql_model.pt"
-    if pt_path.exists() and pt_path.stat().st_size > 0:
-        has_any_ckpt = True
-    if not has_any_ckpt:
-        problems.append(f"{logs_dir}\\model_*.d3 또는 {pt_path} 중 하나")
+    if not has_any_d3:
+        problems.append(f"{logs_dir}\\model_*.d3 (최소 1개)")
 
     if problems:
-        msg = "다음 필수 파일(중 하나 이상)이 없습니다 또는 비어 있습니다:\n- " + "\n- ".join(problems)
+        msg = "다음 필수 파일이 없습니다(또는 비어 있음):\n- " + "\n- ".join(problems)
         raise FileNotFoundError(msg)
+
+# d3rlpy DiscreteCQL 모델 로드: .d3 최신 → (가능하면) .pt는 사용하지 말 것
+def load_discrete_cql_with_fallback(params_path: Path, model_dir: Path, device: str):
+    """
+    우선순위: 가장 큰 스텝의 model_*.d3 -> 나머지 d3
+    (최후 수단) cql_model.pt는 되도록 사용하지 않음. 필요 시만 활성화.
+    """
+    algo = DiscreteCQL.from_json(params_path, device=device)
+
+    logs_dir = model_dir / "d3rlpy_logs" / "DiscreteCQL"
+    d3_candidates = sorted(
+        logs_dir.glob("model_*.d3"),
+        key=lambda p: int(p.stem.split("_")[-1]),
+        reverse=True
+    )
+
+    tried_msgs = []
+
+    # 1) d3rlpy 네이티브 체크포인트(.d3) 최신부터 로드
+    for p in d3_candidates:
+        try:
+            algo.load_model(str(p))
+            return algo, f"loaded: {p.name}"
+        except Exception as ex:
+            tried_msgs.append(f"d3 fail {p.name}: {type(ex).__name__}: {ex}")
+
+    # 2) (비권장) .pt로 후퇴 — 가능하면 .pt는 이동/삭제하여 사용하지 않길 권장
+    # pt_path = model_dir / "cql_model.pt"
+    # if pt_path.exists() and pt_path.stat().st_size > 0:
+    #     try:
+    #         algo.load_model(str(pt_path))
+    #         return algo, f"loaded (pt): {pt_path.name}"
+    #     except Exception as ex:
+    #         tried_msgs.append(f"pt fail {pt_path.name}: {type(ex).__name__}: {ex}")
+
+    detail = "\n".join(tried_msgs) if tried_msgs else "(no candidates found)"
+    raise RuntimeError("모델(.d3) 로딩 실패.\n" + detail)
 
 # AI 전략가
 class MarketQuantum:
-    def __init__(self, model_dir: Path, params_path: Path, scaler: StandardScaler, node_data_path: Path):
+    def __init__(self, model_dir: Path, params_path: Path, node_data_path: Path):
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         self.model, source_info = load_discrete_cql_with_fallback(params_path, model_dir, self.device)
         self.source_info = source_info
 
-        self.scaler = scaler
+        # 임베딩 로드
         self.df_embeddings = pd.read_csv(node_data_path)
 
-        # 프로젝트 스토리라인과 맞춘 전략명
+        # 프로젝트 스토리라인에 맞춘 전략 라벨
         self.action_map = {
             0: "전략 0 (현상 유지·내부역량 강화)",
             1: "전략 1 (신규 고객 유치 집중: 콘텐츠·SNS·제휴)",
@@ -209,21 +145,32 @@ class MarketQuantum:
             3: "전략 3 (공격적 확장: 신메뉴+신규·배달 동시 드라이브)",
         }
 
+        # 잠재벡터 컬럼 확인
         self.latent_cols = [f'latent_{i}' for i in range(LATENT_DIM)]
         missing_latent = [c for c in self.latent_cols if c not in self.df_embeddings.columns]
         if missing_latent or 'ENCODED_MCT' not in self.df_embeddings.columns:
             need = missing_latent + (['ENCODED_MCT'] if 'ENCODED_MCT' not in self.df_embeddings.columns else [])
             raise ValueError(f"node_embeddings.csv 컬럼 누락: {need}")
 
+        # ✅ 핵심 패치: 훈련이 '무스케일'이었으므로 추론도 무스케일 고정
+        #    (재학습 시 정규화 사용으로 바꾸면, 아래 플래그를 True로만 바꾸면 됨)
+        self._use_scaler = False
+
     def get_state_vector(self, mct_id, monthly_data):
+        # 임베딩 찾기
         row = self.df_embeddings[self.df_embeddings['ENCODED_MCT'] == mct_id]
         if row.empty:
             return None
         latent_vector = row[self.latent_cols].values[0].astype(np.float32)
 
+        # 월 지표(입력): 무스케일 원값 사용
         monthly_df = pd.DataFrame([monthly_data], columns=FEATURES)
-        scaled_monthly = self.scaler.transform(monthly_df).astype(np.float32).flatten()
+        if self._use_scaler:
+            # (향후 재학습을 정규화로 돌렸다면 여기에 scaler 적용 코드를 넣으면 됨)
+            raise RuntimeError("현재 설정은 무스케일 추론입니다. 스케일 사용으로 전환 시 _use_scaler=True와 scaler 적용 코드를 추가하세요.")
+        scaled_monthly = monthly_df.values.astype(np.float32).flatten()
 
+        # 최종 상태 벡터 = [latent(16) || features(5)]
         state_vector = np.concatenate([latent_vector, scaled_monthly]).astype(np.float32)
         return state_vector
 
@@ -235,7 +182,7 @@ class MarketQuantum:
         actions = self.model.predict(np.expand_dims(state_vector, axis=0))
         action_idx = int(actions[0])
 
-        # 동점 타이브레이크(항상 0으로 고정되는 현상 완화)
+        # 동점 타이브레이크(평탄 Q 완화; 정상 모델에선 영향 적음)
         try:
             q = self.model.predict_value(np.expand_dims(state_vector, axis=0))[0]
             best = float(np.max(q))
@@ -247,13 +194,13 @@ class MarketQuantum:
 
         return self.action_map.get(action_idx, f"알 수 없음(action={action_idx})")
 
-# 관측 차원 vs 입력 차원 검증
+# 관측 차원 검증(선택)
 def _sanity_check_schema(agent: MarketQuantum):
-    cols = agent.latent_cols + FEATURES
     try:
         obs_shape = agent.model.observation_shape  # 예: (21,)
-        if obs_shape and obs_shape[0] != len(cols):
-            st.error(f"관측 차원 불일치: 모델 {obs_shape[0]} vs 현재 입력 {len(cols)}")
+        expected = LATENT_DIM + len(FEATURES)
+        if obs_shape and obs_shape[0] != expected:
+            st.error(f"관측 차원 불일치: 모델 {obs_shape[0]} vs 현재 입력 {expected}")
     except Exception:
         pass
 
@@ -261,11 +208,9 @@ def _sanity_check_schema(agent: MarketQuantum):
 def load_ai_agent():
     paths = get_paths()
     assert_minimum_files(paths)
-    scaler = ensure_scaler(paths)
     agent = MarketQuantum(
         model_dir=paths["MODEL_DIR"],
         params_path=paths["PARAMS_JSON"],
-        scaler=scaler,
         node_data_path=paths["NODE_EMB"],
     )
     _sanity_check_schema(agent)
@@ -285,9 +230,7 @@ except Exception as e:
 
 # 2) 제목/설명
 st.title("📈 마켓 퀀텀: AI 전략 시뮬레이터")
-st.markdown(
-    "성동구 상권 디지털 트윈 기반으로 점포별 **미래 성공 확률을 높이는 전략**을 제안합니다."
-)
+st.markdown("성동구 상권 디지털 트윈 기반으로 점포별 **미래 성공 확률을 높이는 전략**을 제안합니다.")
 st.caption(
     f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'} / Policy: DiscreteCQL / {agent.source_info}"
 )
@@ -342,6 +285,7 @@ if run_button:
         else:
             try:
                 q_values = agent.model.predict_value(np.expand_dims(state_vec, axis=0))[0]
+                spread = float(np.max(q_values) - np.min(q_values))
                 st.write("로드된 체크포인트:", agent.source_info)
                 st.write("Q-values:", [float(x) for x in q_values])
                 st.write(
@@ -353,16 +297,17 @@ if run_button:
                         "mean": float(np.mean(state_vec)),
                     }
                 )
-                spread = float(np.max(q_values) - np.min(q_values))
                 if spread < 1e-3:
                     st.warning("모든 액션의 Q값이 거의 동일합니다. "
-                               "모델 미학습이거나 입력 스케일/피처 순서가 학습 때와 다를 수 있습니다.")
+                               "훈련/추론 입력 분포 불일치 또는 모델 미학습 가능성이 있습니다.")
+                else:
+                    st.success(f"Q spread OK: {spread:.4f}")
             except Exception as ex:
                 st.error(f"Q-values 계산 실패: {type(ex).__name__}: {ex}")
 
 # 사용 팁:
-# - PowerShell에서:
-#     PS C:\Users\hyunj\Bigcontest\App> python .\run_simulation.py
-#   또는 프로젝트 루트에서:
-#     PS C:\Users\hyunj\Bigcontest> python .\App\run_simulation.py
-# - Gym 경고는 정보성. 필요시 `pip install gymnasium`로 제거 가능
+# - PowerShell:
+#     PS C:\Users\hyunj\Bigcontest\App> py -3.13 .\run_simulation.py
+#   또는 프로젝트 루트:
+#     PS C:\Users\hyunj\Bigcontest> py -3.13 .\App\run_simulation.py
+# - 캡션이 반드시 'loaded: model_XXXX.d3' 형태여야 하며, '(pt)'가 보이면 .pt를 치우고 재실행하세요.
