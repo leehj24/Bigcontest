@@ -1,12 +1,16 @@
 # App/run_simulation.py
-# - PowerShell:  py -3.13 .\App\run_simulation.py
-# - Streamlit self-bootstrap (직접 실행해도 streamlit run으로 재기동)
-# - d3 체크포인트를 재귀 탐색하며, 손상 파일(작은 파일)은 자동 스킵
-# - 훈련이 무스케일이었으므로 추론도 무스케일(스케일 OFF)로 통일
-# - Q-values 디버그 패널 제공
+# - Streamlit self-bootstrap
+# - DiscreteCQL(v2) 체크포인트 로더: 고정 폴더(Model/d3rlpy_logs/DiscreteCQL/) 우선
+#   * params.json → DiscreteCQLConfig.from_json → cfg.create(device) → 더미 Dataset으로 build → .d3 로드
+#   * 100KB 이하 .d3는 자동 스킵
+#   * 고정 폴더가 비면 logs_root 전체를 후순위로 스캔
+# - PyTorch 2.6+ 호환: d3rlpy 내부 torch.load(weights_only=True) 회피 패치
+# - 현재 앱은 무스케일 추론(원값). 필요 시 스케일러 적용 코드의 TODO 주석 참고
 
 import os, sys, subprocess, random
 from pathlib import Path
+import json
+import warnings
 
 # ------------------------------------------------------------
 # Self-bootstrap: python으로 직접 실행하면 streamlit run으로 재실행
@@ -26,14 +30,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import torch
-from d3rlpy.algos import DiscreteCQL
+
+from d3rlpy.algos import DiscreteCQLConfig
+from d3rlpy.dataset import MDPDataset
+
+# Gym 경고가 거슬리면 억제(환경을 쓰지 않으므로 안전)
+warnings.filterwarnings("ignore", message="Gym has been unmaintained since 2022")
 
 # --- PyTorch 2.6+ 호환: d3rlpy 내부 torch.load(weights_only=True) 회피 ---
 import torch as _torch
 _torch_load_orig = _torch.load
 def _torch_load_compat(*args, **kwargs):
-    # 🔧 d3rlpy가 명시적으로 True를 주입해도 무조건 False로 고정
-    kwargs["weights_only"] = False
+    kwargs["weights_only"] = False  # 강제
     return _torch_load_orig(*args, **kwargs)
 _torch.load = _torch_load_compat
 # ---------------------------------------------------------------------------
@@ -53,10 +61,12 @@ def get_paths():
     root_dir = app_dir.parent                        # .../Bigcontest
     model_dir = root_dir / "Model"
     logs_root = model_dir / "d3rlpy_logs"           # d3rlpy가 생성하는 루트
+    fixed_dir = logs_root / "DiscreteCQL"            # 고정 폴더(앱이 우선 읽음)
     return {
         "ROOT": root_dir,
         "MODEL_DIR": model_dir,
         "LOGS_ROOT": logs_root,
+        "FIXED_DIR": fixed_dir,
         "NODE_EMB": model_dir / "node_embeddings.csv",
     }
 
@@ -64,9 +74,9 @@ def assert_minimum_files(paths: dict):
     problems = []
     if not paths["NODE_EMB"].exists():
         problems.append(str(paths["NODE_EMB"]))
-    # 재귀로 .d3 존재 여부 확인
-    has_any_d3 = any(paths["LOGS_ROOT"].rglob("model_*.d3")) if paths["LOGS_ROOT"].exists() else False
-    if not has_any_d3:
+    def _has_d3(root: Path) -> bool:
+        return any(root.rglob("model_*.d3")) if root.exists() else False
+    if not (_has_d3(paths["FIXED_DIR"]) or _has_d3(paths["LOGS_ROOT"])):  # 어느 한 곳엔 있어야 함
         problems.append(f"{paths['LOGS_ROOT']}\\**\\model_*.d3 (최소 1개)")
     if problems:
         raise FileNotFoundError("다음 필수 파일이 없습니다(또는 비어 있음):\n- " + "\n- ".join(problems))
@@ -78,42 +88,103 @@ def _extract_step_num(p: Path) -> int:
     except Exception:
         return -1
 
-def load_discrete_cql_with_fallback(logs_root: Path, device: str):
-    # ❶ 먼저 정식 저장본(model_final.d3)부터 시도
-    final_ckpt = next(logs_root.rglob("model_final.d3"), None)
-    if final_ckpt and final_ckpt.exists() and final_ckpt.stat().st_size > 0:
-        params = final_ckpt.parent / "params.json"
-        if params.exists():
-            algo = DiscreteCQL.from_json(params, device=device)
-            algo.load_model(str(final_ckpt))
-            return algo, f"loaded: {final_ckpt.name} @ {final_ckpt.parent.name}"
+def _safe_build_from_params_json_v2(config_path: Path, device: str):
+    obj = json.loads(config_path.read_text(encoding="utf-8"))
 
-    # ❷ (보조) 주기 저장본(model_*.d3)을 사용 — 단, 크기>100KB만
-    cands = [p for p in logs_root.rglob("model_*.d3") if p.stat().st_size > 100_000]
-    if not cands:
-        raise RuntimeError("체크포인트(.d3)를 찾지 못했습니다.")
+    # --- obs_dim / action_size 힌트 추출 ---
+    obs_shape = obj.get("observation_shape") or [21]
+    if isinstance(obs_shape, list):
+        obs_shape = tuple(obs_shape)
+    elif not isinstance(obs_shape, tuple):
+        obs_shape = (int(obs_shape),)
+    obs_dim = int(obs_shape[0] if len(obs_shape) else 21)
 
-    cands = sorted(cands, key=lambda p: (int(p.stem.split('_')[-1]), p.stat().st_mtime), reverse=True)
+    action_size_hint = int(
+        obj.get("action_size")
+        or obj.get("config", {}).get("action_size")
+        or 4
+    )
+
+    # --- ✅ Config 생성: obj 안에 'config'가 있으면 그걸로, 아니면 json 파일 경로(str)로 ---
+    if "config" in obj and isinstance(obj["config"], dict):
+        cfg = DiscreteCQLConfig.from_dict(obj["config"])
+    else:
+        cfg = DiscreteCQLConfig.from_json(str(config_path))
+
+    algo = cfg.create(device=device)
+
+    # ✅ 더미 Dataset (액션 힌트를 '최대값=action_size_hint-1'로 줘서 action_size를 4로 잡게 함)
+    dummy_obs  = np.zeros((1, obs_dim), dtype=np.float32)
+    dummy_act  = np.array([max(0, action_size_hint - 1)], dtype=np.int64)  # ← 여기!
+    dummy_rew  = np.zeros((1,), dtype=np.float32)
+    dummy_term = np.ones((1,), dtype=np.int64)
+
+    dummy_ds = MDPDataset(
+        observations=dummy_obs,
+        actions=dummy_act,
+        rewards=dummy_rew,
+        terminals=dummy_term,
+    )
+    algo.build_with_dataset(dummy_ds)
+    return algo, obs_dim, action_size_hint
+
+def _scan_candidates(root: Path):
+    """주어진 root 아래의 .d3 후보들을 (step, mtime) 기준 최신 우선 정렬해 반환. 100KB 초과만."""
+    if not root.exists():
+        return []
+    cands = [p for p in root.rglob("model_*.d3") if p.stat().st_size > 100_000]
+    cands = sorted(cands, key=lambda p: (_extract_step_num(p), p.stat().st_mtime), reverse=True)
+    return cands
+
+def load_discrete_cql_with_fallback(logs_root: Path, fixed_dir: Path, device: str):
+    """
+    1) 고정 폴더(DiscreteCQL/)에서 먼저 시도
+    2) 그래도 안 되면 logs_root(타임스탬프 폴더 포함)에서 시도
+    - 항상 같은 폴더의 params.json으로 cfg 생성 → 더미 dataset으로 build → .d3 로딩
+    - 100KB 이하 .d3는 스킵
+    """
     tried = []
-    for ckpt in cands:
-        params = ckpt.parent / "params.json"
-        if not params.exists():
-            tried.append(f"{ckpt.name}: params.json 없음")
-            continue
-        try:
-            algo = DiscreteCQL.from_json(params, device=device)
-            algo.load_model(str(ckpt))
-            return algo, f"loaded: {ckpt.name} @ {ckpt.parent.name}"
-        except Exception as ex:
-            tried.append(f"{ckpt.name}: {type(ex).__name__}: {ex}")
 
-    raise RuntimeError("모델(.d3) 로딩 실패. " + " ".join(tried[:10]))
+    # 1) 고정 폴더 우선
+    cands = _scan_candidates(fixed_dir)
+    if cands:
+        for ckpt in cands:
+            params = ckpt.parent / "params.json"
+            if not params.exists():
+                tried.append(f"{ckpt.name}: params.json 없음 (fixed)")
+                continue
+            try:
+                algo, _, _ = _safe_build_from_params_json_v2(params, device)
+                algo.load_model(str(ckpt))
+                return algo, f"loaded: {ckpt.name} @ {ckpt.parent.name}"
+            except Exception as ex:
+                tried.append(f"{ckpt.name} (fixed): {type(ex).__name__}: {ex}")
+
+    # 2) 타임스탬프 포함 전체 스캔
+    cands = _scan_candidates(logs_root)
+    if cands:
+        for ckpt in cands:
+            params = ckpt.parent / "params.json"
+            if not params.exists():
+                tried.append(f"{ckpt.name}: params.json 없음")
+                continue
+            try:
+                algo, _, _ = _safe_build_from_params_json_v2(params, device)
+                algo.load_model(str(ckpt))
+                return algo, f"loaded: {ckpt.name} @ {ckpt.parent.name}"
+            except Exception as ex:
+                tried.append(f"{ckpt.name}: {type(ex).__name__}: {ex}")
+
+    detail = "\n".join(tried) if tried else "(no candidates)"
+    raise RuntimeError("모델(.d3) 로딩 실패.\n" + detail)
 
 # ------------------ 에이전트 -------------------
 class MarketQuantum:
-    def __init__(self, logs_root: Path, node_data_path: Path):
+    def __init__(self, logs_root: Path, fixed_dir: Path, node_data_path: Path):
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        self.model, self.source_info = load_discrete_cql_with_fallback(logs_root, self.device)
+        self.model, self.source_info = load_discrete_cql_with_fallback(
+            logs_root, fixed_dir, self.device
+        )
 
         # 임베딩 로드
         self.df_embeddings = pd.read_csv(node_data_path)
@@ -133,7 +204,7 @@ class MarketQuantum:
             need = missing_latent + (['ENCODED_MCT'] if 'ENCODED_MCT' not in self.df_embeddings.columns else [])
             raise ValueError(f"node_embeddings.csv 컬럼 누락: {need}")
 
-        # ✅ 훈련=무스케일 → 추론도 무스케일 (원값 사용)
+        # ✅ 현재는 무스케일 추론(원값). 필요 시 스케일러 적용 코드로 전환 가능.
         self._use_scaler = False
 
     def get_state_vector(self, mct_id, monthly_data):
@@ -142,10 +213,9 @@ class MarketQuantum:
             return None
         latent_vector = row[self.latent_cols].values[0].astype(np.float32)
 
-        # 월 지표(입력): 무스케일 원값 사용
         monthly_df = pd.DataFrame([monthly_data], columns=FEATURES)
         if self._use_scaler:
-            # (재학습을 정규화로 바꾸면 여기에 scaler 적용 코드를 넣고 True로 전환)
+            # TODO: 스케일 사용 전환 시 scaler 적용
             raise RuntimeError("현재 설정은 무스케일 추론입니다. 스케일 사용 전환 시 scaler 적용 코드를 추가하세요.")
         feat_vec = monthly_df.values.astype(np.float32).flatten()
 
@@ -186,6 +256,7 @@ def load_ai_agent():
     assert_minimum_files(paths)
     agent = MarketQuantum(
         logs_root=paths["LOGS_ROOT"],
+        fixed_dir=paths["FIXED_DIR"],
         node_data_path=paths["NODE_EMB"],
     )
     _sanity_check_schema(agent)
@@ -280,6 +351,6 @@ if run_button:
                 st.error(f"Q-values 계산 실패: {type(ex).__name__}: {ex}")
 
 # 사용 팁
+# - 학습:   py -3.13 .\Model\train_cql.py
+# - 결과:   Model/d3rlpy_logs/DiscreteCQL/  ← 이 폴더를 우선 사용
 # - 실행:   py -3.13 .\App\run_simulation.py
-# - 캡션:   loaded: model_*.d3 @ DiscreteCQL_YYYYMMDD... 형태가 떠야 정상
-# - 손상된 .d3(아주 작은 파일)는 자동으로 스킵되며, 타임스탬프 폴더도 자동 검색됨
