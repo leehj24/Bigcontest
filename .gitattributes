@@ -1,0 +1,3 @@
+# Torch/D3RL weights are binary  never do EOL conversion
+*.d3 binary
+Model/d3rlpy_logs/**/model_*.d3 -text
