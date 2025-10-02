@@ -132,3 +132,10 @@ latest = d3_list[-1]
 echo(f"최신 체크포인트: {latest.relative_to(MODEL_DIR)} (size={latest.stat().st_size:,} bytes)")
 
 print("훈련 완료. 체크포인트는 여기:", LOGS_ROOT)
+
+# ---- 학습 직후, d3rlpy 공식 저장 API로 정식 모델 내보내기 ----
+FINAL_DIR = MODEL_DIR / "d3rlpy_logs" / "DiscreteCQL"
+FINAL_DIR.mkdir(parents=True, exist_ok=True)
+FINAL_MODEL = FINAL_DIR / "model_final.d3"
+algo.save_model(str(FINAL_MODEL))
+print(f"[train_cql] 최종 모델 저장: {FINAL_MODEL}")
