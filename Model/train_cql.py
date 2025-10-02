@@ -1,17 +1,19 @@
-# Model/train_cql.py  (d3rlpy 최신 호환: no logdir/with_timestamp/experiment_name)
+# Model/train_cql.py  (d3rlpy 최신 호환: factory 객체 사용 + build 명시)
 import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from d3rlpy.algos import DiscreteCQL, DiscreteCQLConfig
 from d3rlpy.dataset import MDPDataset
+from d3rlpy.models.encoders import VectorEncoderFactory
+from d3rlpy.models.q_functions import MeanQFunctionFactory
 from sklearn.preprocessing import StandardScaler
 import joblib
 import time
 
 ROOT = Path(__file__).resolve().parents[1]   # Bigcontest
 MODEL_DIR = ROOT / "Model"
-LOGS_ROOT = MODEL_DIR / "d3rlpy_logs"        # d3rlpy 기본 로그는 ./d3rlpy_logs 기준 (작업 디렉터리)
+LOGS_ROOT = MODEL_DIR / "d3rlpy_logs"
 LOGS_ROOT.mkdir(parents=True, exist_ok=True)
 
 def echo(msg): print(f"[train_cql] {msg}")
@@ -74,50 +76,45 @@ dataset = MDPDataset(
     terminals=terminals,
 )
 
-# CQL 설정 (지원되는 인자만)
+# CQL 설정: 문자열 대신 '팩토리 객체' 사용!  ⬇⬇
 cfg = DiscreteCQLConfig(
     gamma=0.99,
     learning_rate=3e-4,
     batch_size=1024,
-    encoder_factory="vector",
-    q_func_factory="mean",
+    encoder_factory=VectorEncoderFactory(),      # ✅ 객체
+    q_func_factory=MeanQFunctionFactory(),       # ✅ 객체
     n_critics=2,
-    alpha=1.0,   # 보수성
+    alpha=1.0,                                   # CQL 보수성 계수
 )
 
 device = "cuda:0" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
 algo = DiscreteCQL(cfg, device, 0, False)  # (config, device, seed, enable_ddp)
 echo(f"알고리즘 준비 완료 (device={device})")
 
+# 모델 빌드 (명시)
 try:
-    # d3rlpy 최신 API: 데이터셋 기반으로 네트워크 초기화
     algo.build_with_dataset(dataset)
     echo("모델 빌드 완료: build_with_dataset()")
 except Exception as ex:
-    # 일부 버전/환경에서 build_with_dataset 미동작 시 직접 빌드 폴백
     try:
         obs_dim = obs.shape[1]
         action_size = int(np.max(actions)) + 1
-        if hasattr(algo, "build"):
-            algo.build(observation_shape=(obs_dim,), action_size=action_size)
-            echo(f"모델 빌드 완료: build(observation_shape={(obs_dim,)}, action_size={action_size})")
-        else:
-            raise
+        algo.build(observation_shape=(obs_dim,), action_size=action_size)
+        echo(f"모델 빌드 완료: build(observation_shape={(obs_dim,)}, action_size={action_size})")
     except Exception as ex2:
         raise RuntimeError(
             f"모델 빌드 실패: primary={type(ex).__name__}: {ex} / fallback={type(ex2).__name__}: {ex2}"
         )
 
-# 🔁 로그가 Model/d3rlpy_logs 아래에 생성되도록 작업 디렉터리 이동
+# 로그가 Model/d3rlpy_logs 아래에 생성되도록 작업 디렉터리 이동
 os.chdir(MODEL_DIR)
 echo(f"작업 디렉터리 이동: {MODEL_DIR}")
 
-# 학습 스텝
+# 학습
 N_STEPS = int(os.environ.get("TRAIN_STEPS", "30000"))
 echo(f"학습 시작: n_steps={N_STEPS:,}, 로그 루트={LOGS_ROOT}")
 
 t0 = time.time()
-# ✅ fit에는 지원되는 인자만
 algo.fit(
     dataset,
     n_steps=N_STEPS,
@@ -126,7 +123,7 @@ algo.fit(
 )
 echo(f"학습 종료: {(time.time()-t0):.1f}s")
 
-# 산출물 점검: Model/d3rlpy_logs/**/model_*.d3 재귀 탐색
+# 산출물 점검
 d3_list = sorted(LOGS_ROOT.rglob("model_*.d3"),
                  key=lambda p: int(p.stem.split("_")[-1]))
 if not d3_list:
